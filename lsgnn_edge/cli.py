@@ -32,8 +32,19 @@ class BandGraph(nn.Module):
         self.output = nn.Linear(width, classes)
         self.variant = variant
         self.threshold = threshold
+        self.graph_logits = nn.Parameter(torch.zeros_like(self.graph)) if variant == 'dense' else None
+
+    def effective_graph(self):
+        if self.graph_logits is None:
+            return self.graph
+        weight = torch.sigmoid((self.graph_logits + self.graph_logits.T) / 2)
+        eye = torch.eye(len(weight), device=weight.device)
+        weight = weight * (1 - eye) + eye
+        degree = weight.sum(1).clamp_min(1e-8).rsqrt()
+        return weight * degree[:, None] * degree[None, :]
 
     def forward(self, x):
+        graph = self.effective_graph()
         if self.variant == 'rate':
             events = (torch.rand_like(x) < x.sigmoid()).float()
         elif self.variant == 'ann':
@@ -44,14 +55,14 @@ class BandGraph(nn.Module):
         x = events.unsqueeze(-1)
         activities = []
         ac = torch.zeros(len(x), device=x.device)
-        degree = (self.graph != 0).sum(0).float()
+        degree = (graph != 0).sum(0).float()
         for layer in self.layers:
             ac += x.sum((1, 3)).mul(degree).sum(1) * layer.out_features
             u = torch.zeros(x.shape[0], x.shape[2], layer.out_features, device=x.device)
             last = torch.zeros_like(u)
             output = []
             for tick in range(x.shape[1]):
-                drive = torch.einsum('ij,bjd->bid', self.graph, layer(x[:, tick]))
+                drive = torch.einsum('ij,bjd->bid', graph, layer(x[:, tick]))
                 if self.variant == 'ann':
                     last = drive.relu()
                 else:
@@ -65,6 +76,8 @@ class BandGraph(nn.Module):
 
 
 def prepare(args):
+    if args.steps < 1 or args.bands < 1 or args.window // args.steps // 2 + 1 < args.bands:
+        raise ValueError('Each frame must contain at least one FFT bin per band')
     records = list(csv.DictReader(open(args.manifest, encoding='utf-8')))
     groups = {}
     features, labels, splits, identities = [], [], [], []
@@ -112,12 +125,15 @@ def normalized(adjacency):
 
 
 def train(args):
+    torch.set_num_threads(1)
     torch.manual_seed(args.seed)
     d = np.load(args.data)
     x, y = torch.tensor(d['x']), torch.tensor(d['y'], dtype=torch.long)
     adjacency = d['adjacency']
     if args.variant == 'no_graph':
         adjacency = np.zeros_like(adjacency)
+    if args.variant == 'adjacent':
+        adjacency = (adjacency != 0).astype(float)
     if args.variant == 'dense':
         adjacency = np.ones_like(adjacency) - np.eye(len(adjacency))
     model = BandGraph(normalized(adjacency), int(y.max()) + 1, args.variant, args.width, args.threshold)
@@ -154,6 +170,7 @@ def train(args):
 
 def evaluate(args):
     torch.set_num_threads(1)
+    torch.manual_seed(0)
     d = np.load(args.data)
     checkpoint = torch.load(args.model, map_location='cpu', weights_only=False)
     model = BandGraph(checkpoint['graph'], checkpoint['classes'], checkpoint['variant'],
@@ -207,7 +224,7 @@ def main():
     p = commands.add_parser('train')
     p.add_argument('--data', required=True)
     p.add_argument('--output', required=True)
-    p.add_argument('--variant', choices=['full', 'no_graph', 'dense', 'rate', 'ann', 'no_penalty'], default='full')
+    p.add_argument('--variant', choices=['full', 'no_graph', 'dense', 'adjacent', 'rate', 'ann', 'no_penalty'], default='full')
     for name, default in [('seed', 0), ('epochs', 100), ('batch', 64), ('width', 32)]:
         p.add_argument('--' + name, type=int, default=default)
     for name, default in [('lr', .001), ('threshold', .25), ('penalty', .02)]:

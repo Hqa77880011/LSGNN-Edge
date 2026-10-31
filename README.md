@@ -52,7 +52,7 @@ lsgnn-edge evaluate --data bearing.npz --model outputs/full/model.pt --output ou
 
 ## Ablations
 
-Supported controls: `no_graph`, `dense`, `rate`, `ann`, `no_penalty`. Reuse the same inputs, seed and budget. For retrained controls, evaluate the corresponding saved model.
+Supported controls: `no_graph`, `dense`, `adjacent`, `rate`, `ann`, `no_penalty`. Reuse the same inputs, seed and budget. For retrained controls, evaluate the corresponding saved model.
 
 ```bash
 lsgnn-edge train --data bearing.npz --output outputs/no_graph --epochs 100 --seed 0 --variant no_graph
@@ -62,4 +62,22 @@ lsgnn-edge train --data bearing.npz --output outputs/no_graph --epochs 100 --see
 
 `bearing.npz` stores prepared windows/graph. Training writes `model.pt` and `history.json`; evaluation writes `metrics.json`, `predictions.npz` and `confusion.png`. Energy figures use the declared MAC/AC pJ model.
 
-Source inspection: Python 3.13.5, numpy 2.1.3, scipy 1.15.3, torch 2.7.1+cu118, scikit-learn 1.6.1, matplotlib 3.10.0 (installed versions inspected). Checks covered Python syntax, configuration parsing and CLI arguments. No training, full evaluation or CI was run in this update.
+
+## Method, metrics and implementation choices
+
+| Paper item | Code | Entry |
+| --- | --- | --- |
+| Training-only local correlation, delta code, two LIF graph layers | `prepare`, `BandGraph.forward` | `prepare`, `train` |
+| Trainable dense-graph / adjacency-only control | `BandGraph.effective_graph` / `train` | `--variant dense` / `--variant adjacent` |
+| Cross-entropy + normalized hidden spike activity | `train` | `--penalty 0.02 --threshold 0.25` |
+| Accuracy, macro-F1, parameters, spike rate, latency, MAC/AC energy | `evaluate` | `evaluate` |
+
+The dense control learns symmetric nonnegative edge weights with a fixed self-loop and degree normalization. The adjacent control keeps the local training support and removes correlation magnitudes. Rate coding uses Bernoulli input events; evaluation fixes Torch seed 0, so use the same sample order for comparison. Two width-32 layers are the default implementation configuration; parameter counts are computed from the instantiated model and are not copied from the paper. The energy estimate excludes preprocessing, memory traffic and device power. Native-waveform external literature baselines are not supplied here. The existing implementation and this functional update are not the original paper's experiment records.
+
+## Functional validation
+
+```bash
+python tests/smoke.py
+```
+
+Python 3.13.5, PyTorch 2.7.1+cu118, CPU, one Torch thread, seed 0: synthetic recording CSV loading, grouped window preparation, training-only normalization, all seven variants' finite losses/backward and effective parameter updates (including dense graph logits), save/load agreement within atol 1e-7 / rtol 1e-6, two training epochs, evaluation and confusion plot passed. A four-point macro-F1 example is checked against 0.5. Controlled positive hidden weights are used in the gradient check to exercise firing and readout. These checks do not establish benchmark accuracy or hardware energy savings.

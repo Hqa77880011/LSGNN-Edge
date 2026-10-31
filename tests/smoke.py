@@ -58,3 +58,30 @@ assert f1_score([0,0,1,1],[0,1,0,1],average="macro") == .5
 metrics=json.loads((work/"evaluation/metrics.json").read_text())
 assert np.isfinite(metrics["estimated_energy_mj"]) and metrics["estimated_energy_mj"] >= 0
 print(json.dumps({"check":"passed", "variants":7,"epochs":2,"outputs":str(work)}))
+
+from lsgnn_edge.waveform import WaveformClassifier, dense_macs
+native_variants=["cnn","tcn","gru"]
+external=Path("external/Liconvformer.py")
+if external.exists():native_variants.append("liconvformer")
+for variant in native_variants:
+    torch.manual_seed(13)
+    network=WaveformClassifier(2,variant,width=32,external_source=str(external))
+    sample=torch.randn(4,256);labels=torch.tensor([0,1,0,1])
+    first=next(module for module in network.modules() if isinstance(module,torch.nn.Conv1d))
+    last=[module for module in network.modules() if isinstance(module,torch.nn.Linear)][-1]
+    before=first.weight.detach().clone()
+    logits,_,_=network(sample)
+    loss=torch.nn.functional.cross_entropy(logits,labels)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert first.weight.grad.abs().sum()>0 and last.weight.grad.abs().sum()>0
+    assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in network.parameters())
+    torch.optim.Adam(network.parameters(),lr=.001).step()
+    assert not torch.equal(first.weight,before)
+    network.eval();expected=network(sample)[0].detach()
+    torch.save(network.state_dict(),work/f"native_{variant}.pt")
+    restored=WaveformClassifier(2,variant,width=32,external_source=str(external))
+    restored.load_state_dict(torch.load(work/f"native_{variant}.pt",weights_only=True));restored.eval()
+    torch.testing.assert_close(restored(sample)[0],expected,atol=1e-7,rtol=1e-6)
+    assert dense_macs(network,sample[:1])>0
+print('PASS: raw-waveform gradient/update, save/load and operation-count checks',native_variants)

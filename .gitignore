@@ -8,3 +8,5 @@ outputs/
 *.npy
 *.pt
 .env
+
+external/

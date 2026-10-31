@@ -11,6 +11,8 @@ from scipy.io import loadmat
 from sklearn.metrics import accuracy_score, f1_score, ConfusionMatrixDisplay
 from torch import nn
 
+from .waveform import WaveformClassifier, VARIANTS as WAVEFORM_VARIANTS, dense_macs
+
 
 class Spike(torch.autograd.Function):
     @staticmethod
@@ -80,7 +82,7 @@ def prepare(args):
         raise ValueError('Each frame must contain at least one FFT bin per band')
     records = list(csv.DictReader(open(args.manifest, encoding='utf-8')))
     groups = {}
-    features, labels, splits, identities = [], [], [], []
+    features, waveforms, labels, splits, identities = [], [], [], [], []
     for row in records:
         split = row['split']
         if split not in ('train', 'val', 'test'):
@@ -95,6 +97,7 @@ def prepare(args):
             raise ValueError('Each source must contain a finite one-channel vector')
         for start in range(0, len(raw) - args.window + 1, args.window):
             window = raw[start:start + args.window]
+            waveforms.append(window)
             frame_length = args.window // args.steps
             frames = window[:frame_length * args.steps].reshape(args.steps, frame_length)
             power = np.abs(np.fft.rfft(frames * np.hanning(frame_length), axis=-1)) ** 2
@@ -114,7 +117,10 @@ def prepare(args):
     local = np.abs(np.arange(args.bands)[:, None] - np.arange(args.bands)) <= args.radius
     adjacency = np.abs(correlation) * local
     np.fill_diagonal(adjacency, 0)
-    np.savez_compressed(args.output, x=z, y=labels, split=split, group=identities, adjacency=adjacency,
+    waveform = np.asarray(waveforms, dtype=np.float32)
+    waveform_mean = float(waveform[split == "train"].mean())
+    waveform_scale = float(waveform[split == "train"].std().clip(1e-6))
+    np.savez_compressed(args.output, waveform=(waveform-waveform_mean)/waveform_scale, waveform_mean=waveform_mean, waveform_scale=waveform_scale, x=z, y=labels, split=split, group=identities, adjacency=adjacency,
                         mean=mean, scale=scale, window=args.window, steps=args.steps, radius=args.radius)
 
 
@@ -128,7 +134,10 @@ def train(args):
     torch.set_num_threads(1)
     torch.manual_seed(args.seed)
     d = np.load(args.data)
-    x, y = torch.tensor(d['x']), torch.tensor(d['y'], dtype=torch.long)
+    input_key = 'waveform' if args.variant in WAVEFORM_VARIANTS else 'x'
+    if input_key not in d:
+        raise ValueError('Re-run prepare to include raw waveforms for this baseline')
+    x, y = torch.tensor(d[input_key]), torch.tensor(d['y'], dtype=torch.long)
     adjacency = d['adjacency']
     if args.variant == 'no_graph':
         adjacency = np.zeros_like(adjacency)
@@ -139,7 +148,9 @@ def train(args):
         np.fill_diagonal(adjacency, 0)
     if args.variant == 'dense':
         adjacency = np.ones_like(adjacency) - np.eye(len(adjacency))
-    model = BandGraph(normalized(adjacency), int(y.max()) + 1, args.variant, args.width, args.threshold)
+    model = (WaveformClassifier(int(y.max())+1, args.variant, args.width, getattr(args, 'external_source', None))
+             if args.variant in WAVEFORM_VARIANTS else
+             BandGraph(normalized(adjacency), int(y.max())+1, args.variant, args.width, args.threshold))
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     train_ids = np.flatnonzero(d['split'] == 'train')
     val_ids = np.flatnonzero(d['split'] == 'val')
@@ -152,7 +163,7 @@ def train(args):
         for batch in torch.tensor(train_ids)[torch.randperm(len(train_ids))].split(args.batch):
             logits, activity, _ = model(x[batch])
             loss = nn.functional.cross_entropy(logits, y[batch])
-            if args.variant not in ('no_penalty', 'ann'):
+            if args.variant not in ('no_penalty', 'ann') and args.variant not in WAVEFORM_VARIANTS:
                 loss = loss + args.penalty * activity
             optimizer.zero_grad()
             loss.backward()
@@ -167,7 +178,7 @@ def train(args):
             best = val
             torch.save({'state': model.state_dict(), 'variant': args.variant, 'width': args.width,
                         'threshold': args.threshold, 'classes': int(y.max()) + 1,
-                        'graph': normalized(adjacency)}, output / 'model.pt')
+                        'graph': normalized(adjacency), 'external_source': getattr(args, 'external_source', None)}, output / 'model.pt')
     (output / 'history.json').write_text(json.dumps(history, indent=2))
 
 
@@ -176,8 +187,10 @@ def evaluate(args):
     torch.manual_seed(0)
     d = np.load(args.data)
     checkpoint = torch.load(args.model, map_location='cpu', weights_only=False)
-    model = BandGraph(checkpoint['graph'], checkpoint['classes'], checkpoint['variant'],
-                      checkpoint['width'], checkpoint['threshold'])
+    native = checkpoint['variant'] in WAVEFORM_VARIANTS
+    model = (WaveformClassifier(checkpoint['classes'], checkpoint['variant'], checkpoint['width'], getattr(args,'external_source',None) or checkpoint.get('external_source')) if native else
+             BandGraph(checkpoint['graph'],checkpoint['classes'],checkpoint['variant'],checkpoint['width'],checkpoint['threshold']))
+    input_key = 'waveform' if native else 'x'
     model.load_state_dict(checkpoint['state'])
     model.eval()
     ids = np.flatnonzero(d['split'] == 'test')
@@ -185,7 +198,7 @@ def evaluate(args):
     with torch.no_grad():
         for i in ids:
             start = time.perf_counter()
-            logits, rate, ac = model(torch.tensor(d['x'][i:i + 1]))
+            logits, rate, ac = model(torch.tensor(d[input_key][i:i + 1]))
             latencies.append((time.perf_counter() - start) * 1000)
             truth.append(int(d['y'][i]))
             prediction.append(int(logits.argmax(1)))
@@ -193,14 +206,14 @@ def evaluate(args):
             accumulations.append(float(ac[0]))
     bands, ticks = d['x'].shape[2], d['x'].shape[1]
     width = checkpoint['width']
-    mac = width * checkpoint['classes']
+    mac = dense_macs(model, torch.tensor(d[input_key][ids[:1]])) if native else width * checkpoint['classes']
     if checkpoint['variant'] == 'ann':
         mac += ticks * bands * (width + width * width)
         mac += ticks * np.count_nonzero(checkpoint['graph']) * width * 2
         accumulations = [0.] * len(ids)
     result = {'accuracy': accuracy_score(truth, prediction), 'macro_f1': f1_score(truth, prediction, average='macro'),
               'parameters': sum(p.numel() for p in model.parameters()),
-              'spike_rate': float(np.mean(rates)) if checkpoint['variant'] != 'ann' else None,
+              'spike_rate': float(np.mean(rates)) if checkpoint['variant'] != 'ann' and not native else None,
               'latency_median_ms': float(np.median(latencies)), 'latency_p95_ms': float(np.quantile(latencies, .95)),
               'mean_spike_accumulations': float(np.mean(accumulations)), 'dense_macs': mac,
               'estimated_energy_mj': float((mac * args.mac_pj + np.mean(accumulations) * args.ac_pj) * 1e-9)}
@@ -227,7 +240,8 @@ def main():
     p = commands.add_parser('train')
     p.add_argument('--data', required=True)
     p.add_argument('--output', required=True)
-    p.add_argument('--variant', choices=['full', 'no_graph', 'dense', 'adjacent', 'rate', 'ann', 'no_penalty'], default='full')
+    p.add_argument('--variant', choices=['full', 'no_graph', 'dense', 'adjacent', 'rate', 'ann', 'no_penalty', *WAVEFORM_VARIANTS], default='full')
+    p.add_argument('--external-source')
     for name, default in [('seed', 0), ('epochs', 100), ('batch', 64), ('width', 32)]:
         p.add_argument('--' + name, type=int, default=default)
     for name, default in [('lr', .001), ('threshold', .25), ('penalty', .02)]:
@@ -235,7 +249,12 @@ def main():
     p = commands.add_parser('evaluate')
     for name in ['data', 'model', 'output']:
         p.add_argument('--' + name, required=True)
+    p.add_argument('--external-source')
     p.add_argument('--mac-pj', type=float, default=4.6)
     p.add_argument('--ac-pj', type=float, default=.9)
     args = parser.parse_args()
     {'prepare': prepare, 'train': train, 'evaluate': evaluate}[args.command](args)
+
+
+if __name__ == '__main__':
+    main()

@@ -115,7 +115,7 @@ def prepare(args):
     adjacency = np.abs(correlation) * local
     np.fill_diagonal(adjacency, 0)
     np.savez_compressed(args.output, x=z, y=labels, split=split, group=identities, adjacency=adjacency,
-                        mean=mean, scale=scale, window=args.window, steps=args.steps)
+                        mean=mean, scale=scale, window=args.window, steps=args.steps, radius=args.radius)
 
 
 def normalized(adjacency):
@@ -133,7 +133,10 @@ def train(args):
     if args.variant == 'no_graph':
         adjacency = np.zeros_like(adjacency)
     if args.variant == 'adjacent':
-        adjacency = (adjacency != 0).astype(float)
+        radius = int(d['radius']) if 'radius' in d else 2
+        index = np.arange(len(adjacency))
+        adjacency = (abs(index[:, None] - index[None, :]) <= radius).astype(float)
+        np.fill_diagonal(adjacency, 0)
     if args.variant == 'dense':
         adjacency = np.ones_like(adjacency) - np.eye(len(adjacency))
     model = BandGraph(normalized(adjacency), int(y.max()) + 1, args.variant, args.width, args.threshold)

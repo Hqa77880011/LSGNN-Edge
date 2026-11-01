@@ -1,4 +1,4 @@
-"""Small synthetic recording-to-metrics check, not benchmark reproduction."""
+"""Synthetic recording-to-metrics checks."""
 import csv
 import json
 import sys

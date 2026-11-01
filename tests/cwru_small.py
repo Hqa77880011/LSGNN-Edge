@@ -1,4 +1,4 @@
-"""Measured CWRU subset check; not a full benchmark or a paper result."""
+"""Check the measured CWRU subset pipeline."""
 
 import argparse
 import json

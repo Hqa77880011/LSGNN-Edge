@@ -16,7 +16,7 @@ In PowerShell, replace the activation line with `.venv\Scripts\Activate.ps1`.
 
 ## Data and preprocessing
 
-Obtain the original CWRU, Paderborn, MFPT, or XJTU-SY recordings from their dataset maintainers. CWRU is available at https://engineering.case.edu/bearingdatacenter; Paderborn at https://mb.uni-paderborn.de/kat/forschung/kat-datacenter/bearing-datacenter. Keep each dataset separate because sampling rates and fault taxonomies differ. For XJTU-SY, assign health stages from a declared run-to-failure protocol before preparing windows; stage labels are not inferred from filenames.
+Obtain the original CWRU, Paderborn, MFPT, or XJTU-SY recordings from their dataset maintainers. Sources: [CWRU](https://engineering.case.edu/bearingdatacenter) and [Paderborn](https://mb.uni-paderborn.de/kat/forschung/kat-datacenter/bearing-datacenter). Keep each dataset separate because sampling rates and fault taxonomies differ. For XJTU-SY, assign health stages from a declared run-to-failure protocol before preparing windows; stage labels are not inferred from filenames.
 
 Create `recordings.csv`:
 
@@ -62,29 +62,21 @@ lsgnn-edge train --data bearing.npz --output outputs/no_graph --epochs 100 --see
 
 `bearing.npz` stores prepared windows/graph. Training writes `model.pt` and `history.json`; evaluation writes `metrics.json`, `predictions.npz` and `confusion.png`. Energy figures use the declared MAC/AC pJ model.
 
+## Graph and energy conventions
 
-## Method, metrics and implementation choices
+The dense control learns symmetric nonnegative edge weights with a fixed self-loop and degree normalization. The adjacent control connects all frequency bands within the prepared radius and removes correlation magnitudes. Older prepared files without a saved radius use radius 2. Rate coding uses Bernoulli input events; evaluation fixes Torch seed 0, so use the same sample order for comparison. The model defaults to two width-32 layers; parameter counts come from the instantiated network. The energy estimate excludes preprocessing, memory traffic and device power. Native-waveform CNN, TCN and GRU controls plus an adapter to the author's LiConvFormer code are supplied below.
 
-| Paper item | Code | Entry |
-| --- | --- | --- |
-| Training-only local correlation, delta code, two LIF graph layers | `prepare`, `BandGraph.forward` | `prepare`, `train` |
-| Trainable dense-graph / adjacency-only control | `BandGraph.effective_graph` / `train` | `--variant dense` / `--variant adjacent` |
-| Cross-entropy + normalized hidden spike activity | `train` | `--penalty 0.02 --threshold 0.25` |
-| Accuracy, macro-F1, parameters, spike rate, latency, MAC/AC energy | `evaluate` | `evaluate` |
-
-The dense control learns symmetric nonnegative edge weights with a fixed self-loop and degree normalization. The adjacent control connects all frequency bands within the prepared radius and removes correlation magnitudes. Older prepared files without a saved radius use radius 2. Rate coding uses Bernoulli input events; evaluation fixes Torch seed 0, so use the same sample order for comparison. Two width-32 layers are the default implementation configuration; parameter counts are computed from the instantiated model and are not copied from the paper. The energy estimate excludes preprocessing, memory traffic and device power. Native-waveform CNN, TCN and GRU controls plus an adapter to the author's LiConvFormer code are supplied below. The existing implementation and this functional update are not the original paper's experiment records.
-
-## Functional validation
+## Checks
 
 ```bash
 python tests/smoke.py
 ```
 
-Python 3.13.5, PyTorch 2.7.1+cu118, CPU, one Torch thread, seed 0: synthetic recording CSV loading, grouped window preparation, training-only normalization, all seven variants' finite losses/backward and effective parameter updates (including dense graph logits), save/load agreement within atol 1e-7 / rtol 1e-6, two training epochs, evaluation and confusion plot passed. A four-point macro-F1 example is checked against 0.5. Controlled positive hidden weights are used in the gradient check to exercise firing and readout. These checks do not establish benchmark accuracy or hardware energy savings.
+Synthetic recording checks cover grouped preparation, training-only normalization, graph and native-control gradients, parameter updates, checkpoint replay and macro-F1 arithmetic.
 
 ## Native-waveform controls and a measured CWRU subset
 
-`prepare` now retains raw windows alongside graph features. Raw-window mean and scale are fitted only on training recordings. Variants `cnn`, `tcn`, `gru` and `liconvformer` use those identical raw windows; existing graph/event variants retain the original spectral path. CNN/TCN/GRU are explicitly configured matched controls (width 32), not a claim to reproduce an external paper's training recipe.
+`prepare` retains raw windows alongside graph features. Raw-window mean and scale are fitted only on training recordings. Variants `cnn`, `tcn`, `gru` and `liconvformer` use those identical raw windows; existing graph/event variants retain the original spectral path. CNN/TCN/GRU use width 32.
 
 [LiConvFormer author code](https://github.com/yanshen0210/LiConvFormer-a-lightweight-fault-diagnosis-framework) is fetched at commit `8207cddb4df62921187d608e7209579dbdeecf68` and instantiated as the original `Liconvformer(None,1,classes,dim=32)`. It remains under ignored `external/` and is not redistributed here; upstream does not currently include a license file. The adapter restores the batch dimension dropped by the author's final `squeeze()` for batch size one and leaves the upstream file unchanged.
 
@@ -97,6 +89,6 @@ python -m lsgnn_edge.cli evaluate --data data/cwru-small.npz --model outputs/lic
 python tests/cwru_small.py
 ```
 
-The downloader uses the [CWRU university host](https://engineering.case.edu/bearingdatacenter): normal recordings 97/98/99 and 0.007-inch inner-race recordings 105/106/107. Whole recordings at 0/1/2 hp define train/validation/test respectively. Only the first 2 seconds per recording enter this small check. Normal drive-end signals at 48 kHz are anti-alias resampled to 12 kHz to match fault recordings. This is a binary subset, not the full fault taxonomy or the paper's four-dataset evaluation.
+The downloader uses the [CWRU university host](https://engineering.case.edu/bearingdatacenter): normal recordings 97/98/99 and 0.007-inch inner-race recordings 105/106/107. Whole recordings at 0/1/2 hp define train/validation/test respectively. Only the first 2 seconds per recording enter this small check. Normal drive-end signals at 48 kHz are anti-alias resampled to 12 kHz to match fault recordings. This command selects a binary healthy/inner-race subset.
 
-Actual CPU run `python tests/cwru_small.py`: 6 measured recordings, 66 nonoverlapping windows, and one epoch for `full/cnn/tcn/gru/liconvformer` completed training, saved checkpoints, test metrics and plots. The separate smoke checks verify nonzero first-convolution/readout gradients, parameter updates, save/load equality and positive operation counts for native controls. Native energy estimates count Conv/Linear/GRU MACs and explicit broadcast-operation estimates; they exclude activation/normalization, preprocessing and memory costs. No board-level energy measurement is claimed.
+`tests/cwru_small.py` trains and evaluates `full/cnn/tcn/gru/liconvformer` on the six-recording prefix. Native energy estimates count Conv/Linear/GRU MACs and broadcast operations; activation/normalization, preprocessing and memory costs are excluded. Evaluation also reports accuracy, macro-F1, parameters, spike rate and latency.
